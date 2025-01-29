@@ -4,9 +4,8 @@ plugins {
 }
 
 def recordLayerVersion = "3.3.446.0"
-def protobufVersion = "4.29.3"
+def protobufVersion = "3.25.1"
 def recordLayerRepoUrl = "https://ossartifacts.jfrog.io/artifactory/fdb-record-layer/"
-// def generatedFilesDir = "${projectDir}/src/test/generated"
 
 repositories {
     mavenCentral()
@@ -28,5 +27,8 @@ test {
     useJUnitPlatform()
     testLogging {
         events "passed", "skipped", "failed"
+    }
+    testLogging {
+        showStandardStreams = true
     }
 }
