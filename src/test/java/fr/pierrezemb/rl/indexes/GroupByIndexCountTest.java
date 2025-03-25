@@ -1,6 +1,7 @@
 package fr.pierrezemb.rl.indexes;
 
-import com.apple.foundationdb.Range;
+import com.apple.foundationdb.KeyValue;
+import com.apple.foundationdb.async.AsyncIterable;
 import com.apple.foundationdb.record.*;
 import com.apple.foundationdb.record.metadata.Index;
 import com.apple.foundationdb.record.metadata.IndexTypes;
@@ -11,6 +12,7 @@ import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpace;
 import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpacePath;
 import com.apple.foundationdb.record.query.RecordQuery;
 import com.apple.foundationdb.record.query.expressions.Query;
+import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.google.protobuf.Message;
 import fr.pierrezemb.rl.protos.Person;
@@ -18,6 +20,7 @@ import fr.pierrezemb.rl.protos.PersonRecord;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
+import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -49,13 +52,6 @@ class GroupByIndexCountTest {
 
         FDBDatabase db = FDBDatabaseFactory.instance().getDatabase();
         db.performNoOpAsync().get(2, TimeUnit.SECONDS);
-        db.database().run(transaction -> {
-            byte[] start = new byte[1];
-            byte[] end = new byte[1];
-            end[0] = (byte) 0xFE;
-            transaction.clear(new Range(start, end));
-            return null;
-        });
 
         Function<FDBRecordContext, FDBRecordStore> recordStoreProvider = context -> FDBRecordStore.newBuilder()
                 .setMetaDataProvider(recordMetadata)
@@ -111,6 +107,20 @@ class GroupByIndexCountTest {
             Assertions.assertEquals(2, result.size());
 
             result.forEach(System.out::println);
+
+            return null;
+        });
+
+        db.run(context -> {
+            FDBRecordStore recordStore = recordStoreProvider.apply(context);
+            Subspace subspace = recordStore.getSubspace();
+
+            // TODO: scan all keys
+            AsyncIterable<KeyValue> kvs = context.ensureActive().getRange(subspace.range());
+            kvs.forEach(kv -> {
+                Tuple key = Tuple.fromBytes(kv.getKey());
+                System.out.println("Key: " + key + ", Value: " + Arrays.toString(kv.getValue()));
+            });
 
             return null;
         });
