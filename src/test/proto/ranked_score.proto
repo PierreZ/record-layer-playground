@@ -1,0 +1,33 @@
+syntax = "proto3";
+
+package ranked_score;
+
+option java_multiple_files = true;
+option java_package = "fr.pierrezemb.rl.protos.score";
+option java_outer_classname = "RankedScoreRecord";
+
+/**
+ * A simple score entry for demonstrating RANK indexes.
+ * Used in the RANK Index Deep-Dive educational test.
+ */
+message ScoreEntry {
+  // Unique identifier for the player (part of primary key)
+  string player_id = 1;
+
+  // The game this score belongs to (used for grouped rankings)
+  string game = 2;
+
+  // The score value (this is what we rank on)
+  int64 score = 3;
+
+  // Human-readable player name for output
+  string player_name = 4;
+}
+
+/**
+ * Union type required by FDB Record Layer.
+ * Must be named exactly "RecordTypeUnion" for auto-discovery.
+ */
+message RecordTypeUnion {
+  ScoreEntry _score_entry = 1;
+}
