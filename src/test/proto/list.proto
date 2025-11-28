@@ -1,0 +1,42 @@
+syntax = "proto3";
+
+import "record_metadata_options.proto";
+
+option java_multiple_files = true;
+option java_package = "fr.pierrezemb.rl.protos";
+option java_outer_classname = "ListEntryRecord";
+
+/**
+ * Represents a single entry in an ordered list.
+ * Each entry is stored as a separate record, enabling efficient
+ * index-based access through FDB's RANK index (O(log N) vs linked list's O(N)).
+ *
+ * The key insight is:
+ * - Linked lists: O(1) head/tail, O(N) middle access
+ * - FDB RANK index uses skip-lists: O(log N) for all position operations
+ */
+message ListEntry {
+  // The list key name (e.g., "mylist")
+  string list_key = 1;
+
+  // Unique identifier for this entry (UUID)
+  // Required for linsert to find specific elements
+  string entry_id = 2;
+
+  // Sparse position value for ordering (allows insertions between entries)
+  // Using int64 with large gaps (e.g., 1_000_000) between entries
+  // For insertions: new_pos = (pos_before + pos_after) / 2
+  int64 position = 3;
+
+  // The actual value stored in the list
+  bytes value = 4;
+}
+
+/**
+ * Union type required by FDB Record Layer.
+ * Allows multiple record types in the same store.
+ */
+message ListUnion {
+  option (com.apple.foundationdb.record.record).usage = UNION;
+  ListEntry _ListEntry = 1;
+}
