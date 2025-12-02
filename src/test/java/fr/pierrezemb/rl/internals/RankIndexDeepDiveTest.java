@@ -24,6 +24,8 @@ import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpace;
 import com.apple.foundationdb.record.provider.foundationdb.keyspace.KeySpacePath;
 import com.apple.foundationdb.record.query.RecordQuery;
 import com.apple.foundationdb.record.query.expressions.Query;
+import com.apple.foundationdb.record.metadata.expressions.GroupingKeyExpression;
+import com.apple.foundationdb.record.query.plan.plans.RecordQueryPlan;
 import com.apple.foundationdb.subspace.Subspace;
 import com.apple.foundationdb.tuple.Tuple;
 import com.google.protobuf.Message;
@@ -1084,6 +1086,747 @@ class RankIndexDeepDiveTest {
             dumpRankedSetWithEncodingDetails(ctx, store);
             return null;
         });
+
+        printFooter();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //                    TEST 08: QUERY PLANNER - RANK PREDICATE DETECTION
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TEST 08: QUERY PLANNER - How Query.rank() Triggers Automatic Index Selection
+     *
+     * This test demonstrates the MISSING LINK between the RANK index structure (tests 01-07)
+     * and how users actually query it. The key insight: you don't manually specify
+     * IndexScanType.BY_RANK - the QUERY PLANNER does this for you!
+     *
+     * THE QUERY PLANNER'S ROLE:
+     * ─────────────────────────
+     * When you write: Query.rank("score").lessThan(10L)
+     *
+     * The planner:
+     * 1. Detects this is a RANK function via RankComparisons class
+     * 2. Finds matching RANK-type indexes (IndexTypes.RANK)
+     * 3. Generates a plan with IndexScanType.BY_RANK
+     * 4. At execution, rank→score conversion happens automatically
+     *
+     * WITHOUT Query.rank(): Query.field("score").lessThan(500)
+     * → Uses BY_VALUE scan (standard B-tree traversal)
+     *
+     * WITH Query.rank(): Query.rank("score").lessThan(10L)
+     * → Uses BY_RANK scan (skip-list traversal for position-based access)
+     */
+    @Test
+    void test_08_QueryPlanner_RankPredicateDetection() {
+        printHeader("TEST 08: QUERY PLANNER - Rank Predicate Detection");
+
+        System.out.println("""
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  THE QUERY PLANNER: Bridging High-Level Queries to Index Scans                   │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            In tests 01-07, we explored the RANK index internals manually using:
+              store.scanIndex(index, IndexScanType.BY_RANK, ...)
+
+            But in real applications, you use HIGH-LEVEL QUERIES:
+              RecordQuery query = RecordQuery.newBuilder()
+                  .setFilter(Query.rank("score").lessThan(10L))  // "Top 10 players"
+                  .build();
+
+            The QUERY PLANNER automatically:
+            1. Detects Query.rank() predicates (via RankComparisons class)
+            2. Matches them to RANK-type indexes
+            3. Generates IndexScanType.BY_RANK plans
+            4. Handles rank→score conversion at execution time
+
+            Let's see this in action...
+            """);
+
+        KeySpacePath path = keySpace.path("rank-deep-dive", "test08");
+        RecordMetaData metadata = buildMetadata(GLOBAL_RANK_INDEX);
+        Function<FDBRecordContext, FDBRecordStore> storeProvider = createStoreProvider(path, metadata);
+
+        // Insert test data
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+            int[] scores = {100, 200, 300, 400, 500, 600, 700, 800, 900, 1000};
+            for (int i = 0; i < scores.length; i++) {
+                store.saveRecord(ScoreEntry.newBuilder()
+                        .setPlayerId("player" + i)
+                        .setPlayerName("Player " + i)
+                        .setGame("demo")
+                        .setScore(scores[i])
+                        .build());
+            }
+            return null;
+        });
+
+        System.out.println("▶ Inserted 10 players with scores 100, 200, ..., 1000\n");
+
+        // EXAMPLE 1: Query by RANK (uses BY_RANK scan)
+        System.out.println("═".repeat(70));
+        System.out.println("  EXAMPLE 1: Query by RANK - \"Get top 3 players\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            // This uses Query.rank() - triggers RANK index detection
+            RecordQuery rankQuery = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThan(3L))
+                    .build();
+
+            // Show the plan
+            RecordQueryPlan plan = store.planQuery(rankQuery);
+            System.out.println("\n  Query: Query.rank(\"score\").lessThan(3L)");
+            System.out.println("  Plan:  " + plan);
+            System.out.println("\n  ↳ Notice: Plan shows BY_RANK scan type!");
+
+            // Execute and show results
+            System.out.println("\n  Results (rank 0, 1, 2 → lowest 3 scores):");
+            store.executeQuery(rankQuery).forEach(record -> {
+                ScoreEntry entry = ScoreEntry.newBuilder().mergeFrom(record.getRecord()).build();
+                System.out.println("    " + entry.getPlayerName() + " - score: " + entry.getScore());
+            }).join();
+
+            return null;
+        });
+
+        // EXAMPLE 2: Query by VALUE (uses BY_VALUE scan)
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  EXAMPLE 2: Query by VALUE - \"Get players with score < 400\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            // This uses Query.field() - triggers standard VALUE index behavior
+            RecordQuery valueQuery = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.field("score").lessThan(400L))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(valueQuery);
+            System.out.println("\n  Query: Query.field(\"score\").lessThan(400L)");
+            System.out.println("  Plan:  " + plan);
+            System.out.println("\n  ↳ Notice: Plan uses different scan strategy (BY_VALUE or scan)");
+
+            System.out.println("\n  Results:");
+            store.executeQuery(valueQuery).forEach(record -> {
+                ScoreEntry entry = ScoreEntry.newBuilder().mergeFrom(record.getRecord()).build();
+                System.out.println("    " + entry.getPlayerName() + " - score: " + entry.getScore());
+            }).join();
+
+            return null;
+        });
+
+        // EXAMPLE 3: Query by RANK range
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  EXAMPLE 3: Query by RANK range - \"Get players ranked 3-5\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery rankRangeQuery = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.and(
+                            Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).greaterThanOrEquals(3L),
+                            Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThan(6L)
+                    ))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(rankRangeQuery);
+            System.out.println("\n  Query: rank >= 3 AND rank < 6");
+            System.out.println("  Plan:  " + plan);
+
+            System.out.println("\n  Results (ranks 3, 4, 5):");
+            store.executeQuery(rankRangeQuery).forEach(record -> {
+                ScoreEntry entry = ScoreEntry.newBuilder().mergeFrom(record.getRecord()).build();
+                Long rank = getRank(store, entry.getScore());
+                System.out.println("    Rank " + rank + ": " + entry.getPlayerName() +
+                        " - score: " + entry.getScore());
+            }).join();
+
+            return null;
+        });
+
+        System.out.println("""
+
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  KEY INSIGHT: Query.rank() vs Query.field()                                      │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            Query.field("score").lessThan(X)
+            ────────────────────────────────
+            • Meaning: "Find records where score < X"
+            • Planner: Uses BY_VALUE scan on index
+            • Complexity: O(log N) to find start, then O(K) for K results
+
+            Query.rank("score").lessThan(R)
+            ────────────────────────────────
+            • Meaning: "Find records with rank < R" (top R records by score)
+            • Planner: Detects RANK function, uses BY_RANK scan
+            • Complexity: O(log N) to find position, then O(K) for K results
+
+            The MAGIC happens in RankComparisons class:
+            1. Scans the filter for QueryRecordFunctionWithComparison
+            2. Checks if function name is "rank" or "time_window_rank"
+            3. Finds index with matching RANK type and expression
+            4. Generates plan with IndexScanType.BY_RANK
+            """);
+
+        printFooter();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //                        TEST 09: QUERY PLANNER - PLAN EXPLANATION
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TEST 09: QUERY PLANNER - Deep Dive into Plan Structure
+     *
+     * This test shows how to inspect and understand the query plans generated
+     * for RANK index queries, including the internal transformation steps.
+     */
+    @Test
+    void test_09_QueryPlanner_PlanExplain() {
+        printHeader("TEST 09: QUERY PLANNER - Plan Structure Explanation");
+
+        System.out.println("""
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  UNDERSTANDING QUERY PLANS: What the Planner Generates                           │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            The query planner transforms high-level queries into execution plans.
+            For RANK indexes, key plan elements include:
+
+            1. IndexScanType.BY_RANK in the plan output
+            2. Score range bounds derived from rank bounds
+            3. Potential wrapping with RecordQueryScoreForRankPlan
+
+            Plan toString() format:
+            ─────────────────────────
+            Index(idx-global-rank BY_RANK [[0],[3]])
+                        │              │      │
+                        │              │      └── Rank range [0, 3)
+                        │              └── Scan type (BY_RANK vs BY_VALUE)
+                        └── Index name
+
+            Let's examine different query patterns...
+            """);
+
+        KeySpacePath path = keySpace.path("rank-deep-dive", "test09");
+        RecordMetaData metadata = buildMetadata(GLOBAL_RANK_INDEX);
+        Function<FDBRecordContext, FDBRecordStore> storeProvider = createStoreProvider(path, metadata);
+
+        // Insert test data
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+            for (int score = 100; score <= 1000; score += 100) {
+                store.saveRecord(ScoreEntry.newBuilder()
+                        .setPlayerId("p" + score)
+                        .setPlayerName("Player" + score)
+                        .setGame("demo")
+                        .setScore(score)
+                        .build());
+            }
+            return null;
+        });
+
+        System.out.println("▶ Test data: 10 players with scores 100-1000\n");
+
+        // Plan 1: Rank equals
+        System.out.println("═".repeat(70));
+        System.out.println("  PLAN 1: Exact rank lookup - \"Get player at rank 5\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).equalsValue(5L))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("\n  Filter: Query.rank(score).equalsValue(5L)");
+            System.out.println("  Plan:   " + plan);
+            System.out.println("\n  Plan breakdown:");
+            System.out.println("    • Type: Index scan with BY_RANK");
+            System.out.println("    • Range: [[5],[5]] - exact position lookup");
+            System.out.println("    • Execution: Skip-list getNth(5) → O(log N)");
+
+            return null;
+        });
+
+        // Plan 2: Rank less than
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  PLAN 2: Rank range - \"Get top 3 players\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThan(3L))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("\n  Filter: Query.rank(score).lessThan(3L)");
+            System.out.println("  Plan:   " + plan);
+            System.out.println("\n  Plan breakdown:");
+            System.out.println("    • Range: [[0],[3]) - ranks 0, 1, 2");
+            System.out.println("    • Execution: Skip-list scan from rank 0 to rank 3");
+
+            return null;
+        });
+
+        // Plan 3: Combined rank range
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  PLAN 3: Rank between - \"Get players ranked 4-7\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.and(
+                            Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).greaterThanOrEquals(4L),
+                            Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThanOrEquals(7L)
+                    ))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("\n  Filter: rank >= 4 AND rank <= 7");
+            System.out.println("  Plan:   " + plan);
+            System.out.println("\n  Plan breakdown:");
+            System.out.println("    • Range: [[4],[7]] - inclusive range");
+            System.out.println("    • The AND is merged into a single range scan");
+
+            return null;
+        });
+
+        // Plan 4: What happens with VALUE query on RANK index
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  PLAN 4: VALUE query - \"Get players with score > 700\"");
+        System.out.println("═".repeat(70));
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.field("score").greaterThan(700L))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("\n  Filter: Query.field(\"score\").greaterThan(700L)");
+            System.out.println("  Plan:   " + plan);
+            System.out.println("\n  Plan breakdown:");
+            System.out.println("    • RANK index CAN be used for BY_VALUE scans too!");
+            System.out.println("    • Primary subspace (B-tree) is used, not the skip-list");
+            System.out.println("    • This is why RANK index has TWO subspaces");
+
+            return null;
+        });
+
+        System.out.println("""
+
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  PLAN COMPONENTS SUMMARY                                                         │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  Scan Type        │ Subspace Used    │ When Selected                            │
+            ├───────────────────┼──────────────────┼──────────────────────────────────────────┤
+            │  BY_RANK          │ 3 (Skip-List)    │ Query.rank() predicates                  │
+            │  BY_VALUE         │ 2 (B-Tree)       │ Query.field() or value comparisons       │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            Key classes involved:
+            ─────────────────────
+            • RecordQueryPlanner.planRank() - Generates rank-based plans
+            • RankComparisons - Detects and tracks rank predicates
+            • RankIndexMaintainer.scan() - Executes BY_RANK scans
+            • RankedSetIndexHelper.rankRangeToScoreRange() - Converts ranks to scores
+            """);
+
+        printFooter();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //                    TEST 10: QUERY PLANNER - INTERNAL MECHANICS
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TEST 10: QUERY PLANNER - RankComparisons and Index Selection
+     *
+     * This test explores the internal mechanics of how the planner
+     * detects rank predicates and selects appropriate indexes.
+     */
+    @Test
+    void test_10_QueryPlanner_InternalMechanics() {
+        printHeader("TEST 10: QUERY PLANNER - Internal Mechanics");
+
+        System.out.println("""
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  INSIDE THE QUERY PLANNER: RankComparisons Detection                             │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            When the planner receives a query with rank predicates, here's what happens:
+
+            STEP 1: Filter Analysis
+            ───────────────────────
+            The planner creates a RankComparisons object that walks the filter tree:
+
+              new RankComparisons(filter, indexes)
+                    │                    │
+                    │                    └── Available indexes to match against
+                    └── The query filter (e.g., rank(score) < 10)
+
+            STEP 2: Predicate Detection
+            ───────────────────────────
+            RankComparisons.findComparison() checks each comparison:
+
+              if (comparison instanceof QueryRecordFunctionWithComparison) {
+                  RecordFunction<?> fn = comparison.getFunction();
+                  if (FunctionNames.RANK.equals(fn.getName())) {
+                      // This is a rank predicate!
+                      // Find matching RANK-type index...
+                  }
+              }
+
+            STEP 3: Index Matching
+            ──────────────────────
+            For each rank predicate, find an index where:
+              • index.getType() is RANK or TIME_WINDOW_LEADERBOARD
+              • index.getRootExpression() matches the rank function's operand
+
+              Example:
+                Query: Query.rank(field("score").ungrouped()).lessThan(10L)
+                Index: new Index("idx", field("score").ungrouped(), IndexTypes.RANK)
+                       └── Expression matches! Use this index.
+
+            STEP 4: Plan Generation
+            ───────────────────────
+            If a matching index is found:
+              planRank() generates IndexScanComparisons(IndexScanType.BY_RANK, ...)
+
+            Let's demonstrate with different scenarios...
+            """);
+
+        // Scenario 1: Single RANK index, matching query
+        System.out.println("═".repeat(70));
+        System.out.println("  SCENARIO 1: Matching index and query expressions");
+        System.out.println("═".repeat(70));
+
+        System.out.println("""
+
+            Index Definition:
+              field("score").ungrouped()  →  IndexTypes.RANK
+
+            Query Predicate:
+              Query.rank(field("score").ungrouped()).lessThan(5L)
+
+            Planner Logic:
+              1. Extract function: rank(field("score").ungrouped())
+              2. Check index type: RANK ✓
+              3. Compare expressions:
+                 Index:  field("score").ungrouped()
+                 Query:  field("score").ungrouped()
+                 Match! ✓
+              4. Generate BY_RANK plan
+            """);
+
+        KeySpacePath path = keySpace.path("rank-deep-dive", "test10");
+        RecordMetaData metadata = buildMetadata(GLOBAL_RANK_INDEX);
+        Function<FDBRecordContext, FDBRecordStore> storeProvider = createStoreProvider(path, metadata);
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+            for (int i = 0; i < 5; i++) {
+                store.saveRecord(ScoreEntry.newBuilder()
+                        .setPlayerId("p" + i)
+                        .setPlayerName("Player" + i)
+                        .setGame("demo")
+                        .setScore((i + 1) * 100)
+                        .build());
+            }
+            return null;
+        });
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThan(3L))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("  Resulting Plan: " + plan);
+            System.out.println("  ↳ BY_RANK confirms the planner matched the index!");
+
+            return null;
+        });
+
+        // Scenario 2: Grouped index
+        System.out.println("\n" + "═".repeat(70));
+        System.out.println("  SCENARIO 2: Grouped RANK index");
+        System.out.println("═".repeat(70));
+
+        System.out.println("""
+
+            With grouped indexes, the planner handles the grouping prefix automatically:
+
+            Index Definition:
+              field("score").groupBy(field("game"))  →  IndexTypes.RANK
+
+            Query Predicate:
+              Query.rank(field("score").groupBy(field("game"))).lessThan(3L)
+              AND Query.field("game").equalsValue("tetris")
+
+            The planner:
+              1. Matches the grouped expression
+              2. Extracts the group key from other predicates
+              3. Generates: Index(idx BY_RANK [["tetris", 0],["tetris", 3]])
+            """);
+
+        KeySpacePath groupedPath = keySpace.path("rank-deep-dive", "test10-grouped");
+        RecordMetaData groupedMetadata = buildMetadata(GAME_RANK_INDEX);
+        Function<FDBRecordContext, FDBRecordStore> groupedStoreProvider = createStoreProvider(groupedPath, groupedMetadata);
+
+        db.run(ctx -> {
+            FDBRecordStore store = groupedStoreProvider.apply(ctx);
+            String[] games = {"tetris", "tetris", "tetris", "pacman", "pacman"};
+            int[] scores = {100, 200, 300, 150, 250};
+            for (int i = 0; i < games.length; i++) {
+                store.saveRecord(ScoreEntry.newBuilder()
+                        .setPlayerId("p" + i)
+                        .setPlayerName("Player" + i)
+                        .setGame(games[i])
+                        .setScore(scores[i])
+                        .build());
+            }
+            return null;
+        });
+
+        db.run(ctx -> {
+            FDBRecordStore store = groupedStoreProvider.apply(ctx);
+
+            RecordQuery query = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.and(
+                            Query.field("game").equalsValue("tetris"),
+                            Query.rank((GroupingKeyExpression) GAME_RANK_INDEX.getRootExpression()).lessThan(2L)
+                    ))
+                    .build();
+
+            RecordQueryPlan plan = store.planQuery(query);
+            System.out.println("  Query: game = 'tetris' AND rank < 2");
+            System.out.println("  Plan:  " + plan);
+            System.out.println("  ↳ Note the group prefix 'tetris' in the range!");
+
+            return null;
+        });
+
+        System.out.println("""
+
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  SCORE BINDING: RecordQueryScoreForRankPlan                                      │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            When rank predicates can't be directly pushed to the index scan
+            (e.g., complex combinations), the planner wraps the plan:
+
+              RecordQueryScoreForRankPlan
+                │
+                └── Binds rank values to scores at EXECUTION time
+                    by calling evaluateAggregateFunction(SCORE_FOR_RANK, ...)
+
+            This allows the planner to handle:
+              • Rank comparisons with parameter bindings
+              • Complex rank expressions
+              • Runtime rank-to-score conversion
+
+            Key method: RecordQueryScoreForRankPlan.bindScore()
+              1. Evaluates SCORE_FOR_RANK aggregate function
+              2. Gets the actual score value for the rank
+              3. Uses score value in subsequent index scan
+            """);
+
+        printFooter();
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+    //                        TEST 11: QUERY PLANNER - COST MODEL
+    // ═══════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * TEST 11: QUERY PLANNER - Index Selection and Cost Model
+     *
+     * This test demonstrates how the planner chooses between indexes
+     * and the simple cost model used for RANK indexes.
+     */
+    @Test
+    void test_11_QueryPlanner_CostModel() {
+        printHeader("TEST 11: QUERY PLANNER - Index Selection & Cost Model");
+
+        System.out.println("""
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  HOW THE PLANNER CHOOSES INDEXES: A Simple Cost Model                            │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            Unlike sophisticated query optimizers (e.g., PostgreSQL's cost-based optimizer),
+            FDB Record Layer uses a simpler RULE-BASED approach for RANK indexes:
+
+            RULE 1: Type-Based Selection
+            ─────────────────────────────
+            • Query.rank() predicates → Only consider RANK-type indexes
+            • Query.field() predicates → Consider VALUE indexes (including RANK's B-tree)
+
+            There is NO cost comparison between BY_RANK and BY_VALUE scans!
+            The scan type is DETERMINED by the predicate type.
+
+            RULE 2: Column Size Preference
+            ───────────────────────────────
+            When multiple RANK indexes could satisfy a predicate:
+
+              Optional<Index> matchingIndex = indexes.stream()
+                  .filter(index -> requiredTypes.contains(index.getType())
+                                && index.getRootExpression().equals(operand))
+                  .min(Comparator.comparing(Index::getColumnSize));  // ← Prefer fewer columns
+
+            This prefers more selective indexes with fewer group-by columns.
+
+            RULE 3: Score-Based Ranking
+            ───────────────────────────
+            Plans are scored based on how many predicates they satisfy:
+            • More satisfied predicates = higher score = preferred plan
+            • Rank comparisons count toward the plan's score
+
+            Let's see this in practice...
+            """);
+
+        System.out.println("═".repeat(70));
+        System.out.println("  DEMONSTRATION: Same Data, Different Queries → Different Plans");
+        System.out.println("═".repeat(70));
+
+        KeySpacePath path = keySpace.path("rank-deep-dive", "test11");
+        RecordMetaData metadata = buildMetadata(GLOBAL_RANK_INDEX);
+        Function<FDBRecordContext, FDBRecordStore> storeProvider = createStoreProvider(path, metadata);
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+            for (int i = 0; i < 10; i++) {
+                store.saveRecord(ScoreEntry.newBuilder()
+                        .setPlayerId("p" + i)
+                        .setPlayerName("Player" + i)
+                        .setGame("demo")
+                        .setScore((i + 1) * 100)
+                        .build());
+            }
+            return null;
+        });
+
+        db.run(ctx -> {
+            FDBRecordStore store = storeProvider.apply(ctx);
+
+            System.out.println("\n  QUERY A: \"Top 5 by rank\"");
+            System.out.println("  ─────────────────────────");
+            RecordQuery queryA = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).lessThan(5L))
+                    .build();
+            RecordQueryPlan planA = store.planQuery(queryA);
+            System.out.println("  Filter: Query.rank(score).lessThan(5L)");
+            System.out.println("  Plan:   " + planA);
+            System.out.println("  Scan:   BY_RANK (skip-list traversal)");
+
+            System.out.println("\n  QUERY B: \"Score less than 600\"");
+            System.out.println("  ─────────────────────────────");
+            RecordQuery queryB = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.field("score").lessThan(600L))
+                    .build();
+            RecordQueryPlan planB = store.planQuery(queryB);
+            System.out.println("  Filter: Query.field(score).lessThan(600L)");
+            System.out.println("  Plan:   " + planB);
+            System.out.println("  Scan:   BY_VALUE or full scan (B-tree traversal)");
+
+            System.out.println("\n  QUERY C: \"Rank exactly 7\"");
+            System.out.println("  ────────────────────────");
+            RecordQuery queryC = RecordQuery.newBuilder()
+                    .setRecordType("ScoreEntry")
+                    .setFilter(Query.rank((GroupingKeyExpression) GLOBAL_RANK_INDEX.getRootExpression()).equalsValue(7L))
+                    .build();
+            RecordQueryPlan planC = store.planQuery(queryC);
+            System.out.println("  Filter: Query.rank(score).equalsValue(7L)");
+            System.out.println("  Plan:   " + planC);
+            System.out.println("  Scan:   BY_RANK (single position lookup)");
+
+            return null;
+        });
+
+        System.out.println("""
+
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  COST MODEL SUMMARY                                                              │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            ┌───────────────────────────────────────────────────────────────────────────────┐
+            │  Factor                │ How It's Used                                        │
+            ├────────────────────────┼──────────────────────────────────────────────────────┤
+            │  Predicate Type        │ RANK predicates → BY_RANK scan (mandatory)           │
+            │                        │ VALUE predicates → BY_VALUE scan                     │
+            ├────────────────────────┼──────────────────────────────────────────────────────┤
+            │  Index Column Count    │ Fewer columns preferred (more selective)             │
+            ├────────────────────────┼──────────────────────────────────────────────────────┤
+            │  Satisfied Predicates  │ More = better plan score                             │
+            └────────────────────────┴──────────────────────────────────────────────────────┘
+
+            IMPORTANT: There is NO runtime cost estimation!
+            ─────────────────────────────────────────────────
+            The planner does NOT estimate:
+              • Number of rows to scan
+              • I/O costs
+              • Skip-list vs B-tree performance
+
+            This means:
+              • Query.rank(score).lessThan(1000000L) on 10 records → BY_RANK
+              • Query.field(score).lessThan(100) on 1 billion records → BY_VALUE
+
+            The scan type is determined PURELY by predicate type, not data statistics.
+            """);
+
+        System.out.println("""
+            ┌─────────────────────────────────────────────────────────────────────────────────┐
+            │  WHEN TO USE WHICH QUERY STYLE                                                   │
+            └─────────────────────────────────────────────────────────────────────────────────┘
+
+            Use Query.rank() when:
+            ─────────────────────────
+            ✓ You need position-based access ("top N", "rank X")
+            ✓ You want O(log N) access to any position
+            ✓ The rank value is what matters, not the score
+
+            Use Query.field() when:
+            ────────────────────────
+            ✓ You're filtering by actual score values
+            ✓ You want standard range queries
+            ✓ You don't need position information
+
+            Both can use the same RANK index!
+            ─────────────────────────────────
+            • BY_RANK uses the skip-list subspace (3)
+            • BY_VALUE uses the B-tree subspace (2)
+            • One index, two access patterns!
+            """);
 
         printFooter();
     }
